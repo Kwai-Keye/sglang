@@ -165,7 +165,8 @@ class DeepEPBuffer:
             )
 
         if deepep_mode == DeepEPMode.NORMAL:
-            num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
+            # num_qps_per_rank = DeepEPConfig.get_instance().num_sms // 2
+            num_qps_per_rank = 1
         elif deepep_mode in [DeepEPMode.LOW_LATENCY, DeepEPMode.AUTO]:
             num_qps_per_rank = num_experts // group.size()
         else:
@@ -193,7 +194,7 @@ class DeepEPBuffer:
             low_latency_mode=deepep_mode.enable_low_latency(),
             num_qps_per_rank=num_qps_per_rank,
             # TODO can be false when unneeded
-            allow_mnnvl=True,
+            # allow_mnnvl=True,
         )
         return cls._buffer
 
@@ -561,10 +562,10 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 use_fp8=use_fp8,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
-                use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                # round_scale=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                # and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
+                # use_ue8m0=deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+                # and deep_gemm_wrapper.DEEPGEMM_BLACKWELL,
             )
         )
         return packed_recv_hidden, packed_recv_count, event, hook

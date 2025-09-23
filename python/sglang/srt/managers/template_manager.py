@@ -129,6 +129,39 @@ class TemplateManager:
                     logger.info(
                         f"Using default HuggingFace chat template with detected content format: {self._jinja_template_content_format}"
                     )
+
+                    # If the detected format is 'string' while the model is multimodal
+                    # and the HF architectures indicates Keye-DeepSeek, force 'openai' format once.
+                    try:
+                        is_multimodal = bool(
+                            getattr(
+                                getattr(tokenizer_manager, "model_config", None),
+                                "is_multimodal",
+                                False,
+                            )
+                        )
+                        logger.info(f"is_multimodal: {is_multimodal}")
+                        hf_config = getattr(
+                            tokenizer_manager.model_config, "hf_config", None
+                        )
+                        archs = (
+                            getattr(hf_config, "architectures", [])
+                            if hf_config is not None
+                            else []
+                        )
+                        if not isinstance(archs, (list, tuple)):
+                            archs = []
+                        if (
+                            self._jinja_template_content_format == "string"
+                            and is_multimodal
+                            and ("KeyeVLMoeForConditionalGeneration" in archs)
+                        ):
+                            self._jinja_template_content_format = "openai"
+                            logger.info(
+                                "Detected Keye-DeepSeek (by hf_config.architectures) with HF Jinja 'string' format; force using 'openai' format to enable multimodal content."
+                            )
+                    except Exception:
+                        pass
                 else:
                     # Default to string content format if no template was found
                     self._jinja_template_content_format = "string"

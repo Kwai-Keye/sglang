@@ -121,6 +121,8 @@ def process_content_for_template_format(
     video_data: list,
     audio_data: list,
     modalities: list,
+    image_processor_config_merged: dict,
+    video_processor_config_merged: dict,
 ) -> dict:
     """
     Process message content based on detected template format.
@@ -140,6 +142,18 @@ def process_content_for_template_format(
         # Already a string or None, no processing needed
         return {k: v for k, v in msg_dict.items() if v is not None}
 
+    def _merge_mm_config(existing: dict, new: dict) -> dict:
+        """Merge multimodal config dictionaries with later values overriding earlier ones."""
+        if not existing:
+            existing = {}
+        if not new:
+            return existing
+        merged = {**existing}
+        for k, v in new.items():
+            if v is not None:
+                merged[k] = v
+        return merged
+
     if content_format == "openai":
         # OpenAI format: preserve structured content list, normalize types
         processed_content_parts = []
@@ -158,12 +172,38 @@ def process_content_for_template_format(
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'image' type for template compatibility
                     processed_content_parts.append({"type": "image"})
+                    part_cfg = {
+                        "min_pixels": chunk.get("min_pixels"),
+                        "max_pixels": chunk.get("max_pixels"),
+                        "factor": chunk.get("factor"),
+                    }
+                    image_processor_config_merged.update(
+                        {k: v for k, v in part_cfg.items() if v is not None}
+                    )
                 elif chunk_type == "video_url":
                     video_data.append(chunk["video_url"]["url"])
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'video' type for template compatibility
                     processed_content_parts.append({"type": "video"})
+                    # Collect supported fields from the video part itself
+                    part_cfg = {
+                        "max_pixels": chunk.get("max_pixels"),
+                        "min_pixels": chunk.get("min_pixels"),
+                        "total_pixels": chunk.get("total_pixels"),
+                        "nframes": chunk.get("nframes"),
+                        "min_frames": chunk.get("min_frames"),
+                        "max_frames": chunk.get("max_frames"),
+                        "video_start": chunk.get("video_start"),
+                        "video_end": chunk.get("video_end"),
+                        "fps": chunk.get("fps"),
+                        "min_frame_similarity": chunk.get("min_frame_similarity"),
+                        "video_total_pixels": chunk.get("video_total_pixels"),
+                        "factor": chunk.get("factor"),
+                    }
+                    video_processor_config_merged.update(
+                        {k: v for k, v in part_cfg.items() if v is not None}
+                    )
                 elif chunk_type == "audio_url":
                     audio_data.append(chunk["audio_url"]["url"])
                     # Normalize to simple 'audio' type

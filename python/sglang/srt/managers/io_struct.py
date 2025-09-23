@@ -141,6 +141,11 @@ class GenerateReqInput:
     # Image gen grpc migration
     return_bytes: bool = False
 
+    # Image processor config
+    image_processor_config: Optional[dict] = None
+    # Video processor config
+    video_processor_config: Optional[dict] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -542,6 +547,8 @@ class GenerateReqInput:
             label=self.label,
             priority=self.priority,
             return_bytes=self.return_bytes,
+            image_processor_config=self.image_processor_config,
+            video_processor_config=self.video_processor_config,
         )
 
 

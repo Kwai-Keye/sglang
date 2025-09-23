@@ -211,6 +211,7 @@ class ModelConfig:
             or "DeepseekV3ForCausalLMNextN" in self.hf_config.architectures
             or "LongcatFlashForCausalLM" in self.hf_config.architectures
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
+            or "KeyeVLMoeForConditionalGeneration" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
@@ -729,6 +730,8 @@ multimodal_model_archs = [
     "Phi4MMForCausalLM",
     "VILAForConditionalGeneration",
     "Step3VLForConditionalGeneration",
+    "KeyeVL1_5ForConditionalGeneration",
+    "KeyeVLMoeForConditionalGeneration",
 ]
 
 

@@ -119,6 +119,7 @@ from sglang.srt.utils import (
     is_hip,
     is_non_idle_and_non_empty,
     is_npu,
+    is_nvidia_cublas_cu12_version_ge_12_9,
     is_sm100_supported,
     log_info_on_rank0,
     make_layers,
@@ -174,7 +175,7 @@ if _is_hip:
 
 _is_flashinfer_available = is_flashinfer_available()
 _is_sm100_supported = is_cuda() and is_sm100_supported()
-
+_is_cublas_ge_129 = is_nvidia_cublas_cu12_version_ge_12_9()
 
 logger = logging.getLogger(__name__)
 
@@ -1398,9 +1399,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                     self.w_kc.to(torch.bfloat16) * self.w_scale,
                 )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
+            # q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+            #     q_nope.transpose(0, 1),
+            #     zero_allocator.allocate(1),
+            # )
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),
-                zero_allocator.allocate(1),
+                (
+                    torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
+                    if _is_cublas_ge_129
+                    else zero_allocator.allocate(1)
+                ),
             )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
@@ -1513,9 +1522,17 @@ class DeepseekV2AttentionMLA(nn.Module):
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
 
         elif self.w_vc.dtype == torch.float8_e4m3fn:
+            # attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
+            #     attn_output.transpose(0, 1),
+            #     zero_allocator.allocate(1),
+            # )
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
                 attn_output.transpose(0, 1),
-                zero_allocator.allocate(1),
+                (
+                    torch.zeros((1,), dtype=torch.float32, device=attn_output.device)
+                    if _is_cublas_ge_129
+                    else zero_allocator.allocate(1)
+                ),
             )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
@@ -1576,10 +1593,19 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.w_kc.to(torch.bfloat16) * self.w_scale,
             )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
+            # q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+            #     q_nope.transpose(0, 1),
+            #     zero_allocator.allocate(1),
+            #     dtype=torch.float8_e4m3fn,
+            # )
+            # fix bmm_fp8 error under cublas12.9 caused by bumpallocator, detail in pr#11612
             q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
                 q_nope.transpose(0, 1),
-                zero_allocator.allocate(1),
-                dtype=torch.float8_e4m3fn,
+                (
+                    torch.zeros((1,), dtype=torch.float32, device=q_nope.device)
+                    if _is_cublas_ge_129
+                    else zero_allocator.allocate(1)
+                ),
             )
             q_nope_out = bmm_fp8(
                 q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
@@ -1761,10 +1787,18 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.w_vc.to(torch.bfloat16) * self.w_scale,
             )
         elif self.w_vc.dtype == torch.float8_e4m3fn:
+            # attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
+            #     attn_output.transpose(0, 1),
+            #     zero_allocator.allocate(1),
+            #     dtype=torch.float8_e4m3fn,
+            # )
             attn_output_val, attn_output_scale = per_tensor_quant_mla_fp8(
                 attn_output.transpose(0, 1),
-                zero_allocator.allocate(1),
-                dtype=torch.float8_e4m3fn,
+                (
+                    torch.zeros((1,), dtype=torch.float32, device=attn_output.device)
+                    if _is_cublas_ge_129
+                    else zero_allocator.allocate(1)
+                ),
             )
             attn_bmm_output = bmm_fp8(
                 attn_output_val,
@@ -2408,14 +2442,17 @@ class DeepseekV2ForCausalLM(nn.Module):
         if (
             not _is_cuda
             or torch.cuda.get_device_capability("cuda") < (8, 0)
-            or self.config.architectures[0] != architecture
+            or (
+                self.config.architectures[0] != architecture
+                and self.config.architectures[0] != "KeyeVLMoeForConditionalGeneration"
+            )
             or self.config.n_routed_experts != 256
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Only Deepseek V3/R1 on NV-platform with capability >= 80 can use shared experts fusion optimization."
         elif get_moe_expert_parallel_world_size() > 1:
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under expert parallelism."
-        elif self.quant_config.get_name() == "w4afp8":
+        elif self.quant_config is not None and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
 
         if disable_reason is not None:
@@ -2760,6 +2797,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                 "enorm",
                 "hnorm",
             ]
+
+        # print("named_parameters = ", dict(self.named_parameters()), flush=True)
 
         if self.num_fused_shared_experts > 0:
             assert self.num_fused_shared_experts == 1

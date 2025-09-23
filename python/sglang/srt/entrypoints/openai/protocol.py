@@ -310,11 +310,26 @@ class ChatCompletionMessageContentImagePart(BaseModel):
     type: Literal["image_url"]
     image_url: ChatCompletionMessageContentImageURL
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
+    min_pixels: Optional[int] = None
+    max_pixels: Optional[int] = None
+    factor: Optional[int] = None
 
 
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
     video_url: ChatCompletionMessageContentVideoURL
+    max_pixels: Optional[int] = None
+    min_pixels: Optional[int] = None
+    total_pixels: Optional[int] = None
+    nframes: Optional[int] = None
+    min_frames: Optional[int] = None
+    max_frames: Optional[int] = None
+    video_start: Optional[float] = None
+    video_end: Optional[float] = None
+    fps: Optional[float] = None
+    min_frame_similarity: Optional[float] = None
+    video_total_pixels: Optional[int] = None
+    factor: Optional[int] = None
 
 
 class ChatCompletionMessageContentAudioPart(BaseModel):
@@ -917,6 +932,8 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[Any] = None
+    image_processor_config_merged: Optional[Any] = None
+    video_processor_config_merged: Optional[Any] = None
 
 
 class ResponseReasoningTextContent(BaseModel):
