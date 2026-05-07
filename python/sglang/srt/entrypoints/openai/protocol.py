@@ -426,12 +426,14 @@ class ChatCompletionMessageContentImageURL(BaseModel):
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    preprocess_kwargs: Optional[Dict[str, Any]] = None
 
 
 class ChatCompletionMessageContentVideoURL(BaseModel):
     url: str
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    preprocess_kwargs: Optional[Dict[str, Any]] = None
 
 
 class ChatCompletionMessageContentAudioURL(BaseModel):

@@ -123,6 +123,43 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     return config.index_n_heads
 
 
+def is_keye_topk_mask(config: PretrainedConfig) -> bool:
+    """Check if the model is a Keye model with Top-K Mask sparse attention."""
+    return (
+        config.architectures is not None
+        and config.architectures[0] in [
+            "KeyeVL2ForConditionalGeneration",
+            "KeyeVL2MoeForConditionalGeneration",
+        ]
+        and hasattr(config, "sa_config")
+        and config.sa_config is not None
+    )
+
+
+def get_keye_indexer_head_dim(config: PretrainedConfig) -> int:
+    """Get the indexer head dimension for Keye model."""
+    assert is_keye_topk_mask(config)
+    return config.sa_config.get("indexer_head_dim", 128)
+
+
+def get_keye_topk(config: PretrainedConfig) -> int:
+    """Get the topk value for Keye Top-K Mask attention."""
+    assert is_keye_topk_mask(config)
+    return config.sa_config.get("topk", 2048)
+
+
+def get_num_indexer_layers(config) -> int:
+    """Layer count for the global indexer-topk capturer's host buffer.
+
+    NSA models (V3.2) instantiate an Indexer on every transformer layer.
+    Other architectures: set num_indexer_layers on hf_text_config; 0 disables
+    the capturer.
+    """
+    if is_deepseek_nsa(config):
+        return config.num_hidden_layers
+    return getattr(config, "num_indexer_layers", 0)
+
+
 class ModelConfig:
     def __init__(
         self,
@@ -1441,6 +1478,9 @@ multimodal_model_archs = [
     "MiDashengLMModel",
     "StepVLForConditionalGeneration",
     "KimiK25ForConditionalGeneration",
+    "KeyeVL1_5ForConditionalGeneration",
+    "KeyeVL2ForConditionalGeneration",
+    "KeyeVL2MoeForConditionalGeneration",
 ]
 
 piecewise_cuda_graph_disabled_model_archs = [

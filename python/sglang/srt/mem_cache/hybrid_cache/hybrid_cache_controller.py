@@ -389,6 +389,11 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> PrefetchOperation:
+        pool_names = [p.name for p in extra_pools or []]
+        logger.debug(
+            f"[HiCache] prefetch: request_id={request_id}, "
+            f"num_tokens={len(new_input_tokens)}, extra_pools={pool_names}"
+        )
         operation = PrefetchOperation(
             request_id,
             host_indices,
@@ -408,6 +413,11 @@ class HybridCacheController(BaseHiCacheController):
         prefix_keys: Optional[List[str]] = None,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> int:
+        pool_names = [p.name for p in extra_pools or []]
+        logger.debug(
+            f"[HiCache] write_storage: num_tokens={len(token_ids)}, "
+            f"extra_pools={pool_names}"
+        )
         operation = StorageOperation(
             host_indices,
             token_ids,
@@ -431,10 +441,19 @@ class HybridCacheController(BaseHiCacheController):
             prefix_keys=operation.prefix_keys.copy() if operation.prefix_keys else None
         )
         if operation.pool_transfers:
+            logger.debug(
+                "[HiCache] _storage_hit_query: using batch_exists_v2 with "
+                f"{len(operation.pool_transfers)} pool transfers, "
+                f"{len(hash_value)} hash pages"
+            )
             hit_result = self.storage_backend.batch_exists_v2(
                 hash_value, operation.pool_transfers, extra_info
             )
         else:
+            logger.debug(
+                f"[HiCache] _storage_hit_query: using batch_exists(v1) with "
+                f"{len(hash_value)} hash pages"
+            )
             kv_hit_count = self.storage_backend.batch_exists(hash_value, extra_info)
             hit_result = PoolTransferResult(
                 kv_hit_pages=kv_hit_count, extra_pool_hit_pages={}
@@ -442,6 +461,11 @@ class HybridCacheController(BaseHiCacheController):
 
         kv_hit_pages = hit_result.kv_hit_pages
         operation.pool_storage_result.update_kv_hit_pages(kv_hit_pages)
+
+        logger.debug(
+            f"[HiCache] _storage_hit_query: KV hit pages = {kv_hit_pages}/{len(hash_value)}, "
+            f"extra_pool_hits = {hit_result.extra_pool_hit_pages}"
+        )
 
         if kv_hit_pages > 0 and operation.pool_transfers:
             self._sync_trailing_keys(operation.pool_transfers, hash_value, kv_hit_pages)
@@ -482,8 +506,16 @@ class HybridCacheController(BaseHiCacheController):
         # Transfer extra pools
         if operation.pool_transfers and not operation.is_terminated():
             self._resolve_shared_pool_transfers(operation)
+            pool_names = [t.name for t in operation.pool_transfers]
+            logger.debug(
+                f"[HiCache] _page_transfer: loading extra pools {pool_names}, "
+                f"operation_id={operation.id}"
+            )
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            logger.debug(
+                f"[HiCache] _page_transfer: extra pools loaded, results={results}"
+            )
 
         # Transfer kv pools
         super()._page_transfer(operation)
@@ -492,8 +524,16 @@ class HybridCacheController(BaseHiCacheController):
         # Backup extra pools
         if operation.pool_transfers:
             self._resolve_shared_pool_transfers(operation)
+            pool_names = [t.name for t in operation.pool_transfers]
+            logger.debug(
+                f"[HiCache] _page_backup: writing extra pools {pool_names}, "
+                f"operation_id={operation.id}"
+            )
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
+            logger.debug(
+                f"[HiCache] _page_backup: extra pools written, results={results}"
+            )
 
         # Backup kv pools
         super()._page_backup(operation)

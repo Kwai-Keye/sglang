@@ -45,6 +45,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
+from sglang.srt.managers.async_mm_data_processor import AsyncMMDataProcessor
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import (
@@ -299,13 +300,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             # We want to parallelize the image pre-processing so we create an executor for it
             # We create mm_processor for any skip_tokenizer_init to make sure we still encode
             # images even with skip_tokenizer_init=False.
-            self.mm_processor = get_mm_processor(
-                self.model_config.hf_config,
-                server_args,
-                _processor,
-                transport_mode,
-                model_config=self.model_config,
-            )
+            if server_args.mm_processor_workers > 1:
+                from sglang.srt.managers.multimodal_processor_pool import MultimodalProcessorPool
+                self.mm_processor = MultimodalProcessorPool(
+                    self.model_config.hf_config, server_args, _processor, transport_mode,
+                )
+                self.mm_data_processor = None
+            else:
+                self.mm_processor = get_mm_processor(
+                    self.model_config.hf_config,
+                    server_args,
+                    _processor,
+                    transport_mode,
+                    model_config=self.model_config,
+                )
+                timeout_s = (
+                    server_args.mm_per_request_timeout
+                    if server_args.mm_per_request_timeout > 0
+                    else None
+                )
+                self.mm_data_processor = AsyncMMDataProcessor(
+                    self.mm_processor,
+                    max_concurrent_calls=server_args.mm_max_concurrent_calls,
+                    timeout_s=timeout_s,
+                )
 
             if server_args.skip_tokenizer_init:
                 self.tokenizer = self.processor = None
@@ -315,6 +333,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 os.environ["TOKENIZERS_PARALLELISM"] = "false"
         else:
             self.mm_processor = self.processor = None
+            self.mm_data_processor = None
 
             if server_args.skip_tokenizer_init:
                 self.tokenizer = None
@@ -768,13 +787,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         need_wait_for_mm_inputs=obj.need_wait_for_mm_inputs,
                     )
                 if mm_inputs is None:
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
-                        image_data=obj.image_data,
-                        audio_data=obj.audio_data,
-                        input_text=(input_text or input_ids),
-                        request_obj=obj,
-                        max_req_input_len=self.max_req_input_len,
-                    )
+                    if self.server_args.mm_processor_workers > 1:
+                        mm_inputs = await self.mm_processor.process_mm_data_async(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text=(input_text or input_ids),
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
+                    else:
+                        mm_inputs = await self.mm_data_processor.process(
+                            image_data=obj.image_data,
+                            audio_data=obj.audio_data,
+                            input_text_or_ids=(input_text or input_ids),
+                            request_obj=obj,
+                            max_req_input_len=self.max_req_input_len,
+                        )
             elif (
                 self.server_args.language_only
                 and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
@@ -782,13 +810,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 # In language_only mode with zmq_to_scheduler, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
-                    image_data=obj.image_data,
-                    audio_data=obj.audio_data,
-                    input_text=(input_text or input_ids),
-                    request_obj=obj,
-                    max_req_input_len=self.max_req_input_len,
-                )
+                if self.server_args.mm_processor_workers > 1:
+                    mm_inputs = await self.mm_processor.process_mm_data_async(
+                        image_data=obj.image_data,
+                        audio_data=obj.audio_data,
+                        input_text=(input_text or input_ids),
+                        request_obj=obj,
+                        max_req_input_len=self.max_req_input_len,
+                    )
+                else:
+                    mm_inputs = await self.mm_data_processor.process(
+                        image_data=obj.image_data,
+                        audio_data=obj.audio_data,
+                        input_text_or_ids=(input_text or input_ids),
+                        request_obj=obj,
+                        max_req_input_len=self.max_req_input_len,
+                    )
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids

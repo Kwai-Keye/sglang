@@ -139,17 +139,16 @@ class ReqToTokenPool:
         )
 
         self.size = size
+        # +1 padding row at index 0: cuda-graph padded batches default
+        # req_pool_indices to 0, so dummy reads/writes land here harmlessly.
+        self._alloc_size = size + 1
         self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # +1 row for padding slot 0 (mirrors KV pool): cuda-graph padded
-            # batches default req_pool_indices to 0, so routing dummies through
-            # unowned slot 0 keeps req_to_token[0, :] zero and downstream writes
-            # harmless.
             self.req_to_token = torch.zeros(
-                (size + 1, max_context_len), dtype=torch.int32, device=device
+                (self._alloc_size, max_context_len), dtype=torch.int32, device=device
             )
-        self.free_slots = list(range(1, size + 1))
+        self.free_slots = list(range(1, self._alloc_size))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -189,7 +188,7 @@ class ReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(1, self.size + 1))
+        self.free_slots = list(range(1, self._alloc_size))
 
 
 class MambaPool:
@@ -724,17 +723,32 @@ class KVCache(abc.ABC):
 
     def _finalize_allocation_log(self, num_tokens: int):
         """Common logging and mem_usage computation for KV cache allocation.
-        Supports both tuple (K, V) size returns and single KV size returns.
+        Supports:
+        - Single value: total KV size
+        - Tuple (K, V): separate K and V sizes
+        - Tuple (K, V, Indexer): K, V, and indexer cache sizes
         """
         kv_size_bytes = self.get_kv_size_bytes()
         if isinstance(kv_size_bytes, tuple):
-            k_size, v_size = kv_size_bytes
-            k_size_GB = k_size / GB
-            v_size_GB = v_size / GB
-            logger.info(
-                f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
-            )
-            self.mem_usage = k_size_GB + v_size_GB
+            if len(kv_size_bytes) == 3:
+                k_size, v_size, indexer_size = kv_size_bytes
+                k_size_GB = k_size / GB
+                v_size_GB = v_size / GB
+                indexer_size_GB = indexer_size / GB
+                logger.info(
+                    f"KV Cache is allocated. #tokens: {num_tokens}, "
+                    f"K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB, "
+                    f"Indexer size: {indexer_size_GB:.2f} GB"
+                )
+                self.mem_usage = k_size_GB + v_size_GB + indexer_size_GB
+            else:
+                k_size, v_size = kv_size_bytes
+                k_size_GB = k_size / GB
+                v_size_GB = v_size / GB
+                logger.info(
+                    f"KV Cache is allocated. #tokens: {num_tokens}, K size: {k_size_GB:.2f} GB, V size: {v_size_GB:.2f} GB"
+                )
+                self.mem_usage = k_size_GB + v_size_GB
         else:
             kv_size_GB = kv_size_bytes / GB
             logger.info(
@@ -832,11 +846,17 @@ class MHATokenToKVPool(KVCache):
         else:
             self._kv_copy_config = None
 
-        self._finalize_allocation_log(size)
+        if self._should_finalize_in_init():
+            self._finalize_allocation_log(size)
 
         # for store_cache JIT kernel
         self.row_dim = self.head_num * self.head_dim
         self.same_kv_dim = self.head_dim == self.v_head_dim
+
+    def _should_finalize_in_init(self) -> bool:
+        # Subclasses that allocate extra buffers (e.g. an indexer cache) override this to
+        # return False and call _finalize_allocation_log themselves after their own allocation.
+        return True
 
     def _init_kv_copy_and_warmup(self):
         # Heuristics for KV copy tiling
@@ -2081,3 +2101,186 @@ def copy_all_layer_kv_cache_tiled(
     mask = mask_loc[:, None] & mask_byte[None, :]
     vals = tl.load(src_ptr, mask=mask)
     tl.store(tgt_ptr, vals, mask=mask)
+
+
+class KeyeTokenToKVPool(MHATokenToKVPool):
+    """
+    TokenToKVPool for Keye models with Top-K Mask sparse attention.
+
+    Extends MHATokenToKVPool with an FP8 paged indexer K cache that follows
+    the same layout convention as NSATokenToKVPool.index_k_with_scale_buffer,
+    so that index_buf_accessor (GetKAndS / SetKAndS) and deep_gemm kernels
+    can be used without modification.
+
+    Buffer layout (per page, per layer):
+        buf[page_idx]:  uint8  shape (page_size * (index_head_dim + index_head_dim//quant_block_size * 4),)
+            [0 : page_size*index_head_dim]              → FP8 E4M3 key data
+            [page_size*index_head_dim : ...]             → FP32 per-block scale (4 bytes each)
+
+    Constraints:
+        page_size      == 64
+        index_head_dim  in (32, 64, 128)
+        quant_block_size == min(index_head_dim, 128)
+    """
+
+    # quant_block_size is set dynamically in __init__ to min(index_head_dim, 128)
+    # to match the KeyeIndexer's block_size logic.
+    # NOTE: Always access via instance (self.quant_block_size), never via class
+    # (KeyeTokenToKVPool.quant_block_size), because Keye supports head_dim 32/64/128.
+    index_k_with_scale_buffer_dtype = torch.uint8
+
+    def _should_finalize_in_init(self) -> bool:
+        return False
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        head_num: int,
+        head_dim: int,
+        layer_num: int,
+        device: str,
+        index_head_dim: int,
+        enable_memory_saver: bool = False,
+        v_head_dim: Optional[int] = None,
+        start_layer: Optional[int] = None,
+        end_layer: Optional[int] = None,
+        enable_alt_stream: bool = True,
+        enable_kv_cache_copy: bool = False,
+    ):
+        assert page_size == 64, (
+            f"KeyeTokenToKVPool requires page_size=64 for FP8 kernels, got {page_size}"
+        )
+        assert index_head_dim in (32, 64, 128), (
+            f"KeyeTokenToKVPool requires index_head_dim in (32, 64, 128), got {index_head_dim}"
+        )
+        # quant_block_size mirrors NSA: min(head_dim, 128)
+        self.quant_block_size: int = min(index_head_dim, 128)
+
+        super().__init__(
+            size=size,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            v_head_dim=v_head_dim,
+            layer_num=layer_num,
+            device=device,
+            enable_memory_saver=enable_memory_saver,
+            start_layer=start_layer,
+            end_layer=end_layer,
+            enable_alt_stream=enable_alt_stream,
+            enable_kv_cache_copy=enable_kv_cache_copy,
+        )
+
+        self.index_head_dim = index_head_dim
+
+        num_pages = (size + page_size + 1) // self.page_size
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.enable_custom_mem_pool
+                else nullcontext()
+            ):
+                self.index_k_with_scale_buffer: Optional[List[torch.Tensor]] = [
+                    torch.zeros(
+                        # Layout (same as NSA index_k_with_scale_buffer):
+                        #   shape: (num_pages, page_size * (index_head_dim + index_head_dim//quant_block_size * 4))
+                        #   data: for page i,
+                        #       * buf[i, :page_size*index_head_dim] for fp8 data
+                        #       * buf[i, page_size*index_head_dim:].view(float32) for scale
+                        (
+                            num_pages,
+                            self.page_size
+                            * (
+                                index_head_dim
+                                + index_head_dim // self.quant_block_size * 4
+                            ),
+                        ),
+                        dtype=self.index_k_with_scale_buffer_dtype,
+                        device=device,
+                    )
+                    for _ in range(layer_num)
+                ]
+        self._finalize_allocation_log(size)
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        """Return the full paged FP8 buffer for a layer."""
+        assert self.index_k_with_scale_buffer is not None, (
+            "index_k_with_scale_buffer is not allocated. "
+            "Set KEYE_INDEXER_BACKEND=fp8 (default) to enable FP8 path."
+        )
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.index_k_with_scale_buffer[layer_id - self.start_layer]
+
+    def get_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        seq_len: int,
+        page_indices: torch.Tensor,
+    ):
+        """Gather both FP8 K data and F32 scale for a single sequence."""
+        assert self.index_k_with_scale_buffer is not None, (
+            "index_k_with_scale_buffer is not allocated. "
+            "Set KEYE_INDEXER_BACKEND=fp8 (default) to enable FP8 path."
+        )
+        from sglang.srt.layers.attention.keye_topk import keye_index_buf_accessor
+
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        return keye_index_buf_accessor.GetKAndS.execute(
+            self, buf, seq_len=seq_len, page_indices=page_indices
+        )
+
+    def set_index_k_scale_buffer(
+        self,
+        layer_id: int,
+        loc: torch.Tensor,
+        index_k: torch.Tensor,
+        index_k_scale: torch.Tensor,
+    ) -> None:
+        """Write FP8 K + F32 scale to cache at token locations."""
+        assert self.index_k_with_scale_buffer is not None, (
+            "index_k_with_scale_buffer is not allocated. "
+            "Set KEYE_INDEXER_BACKEND=fp8 (default) to enable FP8 path."
+        )
+        from sglang.srt.layers.attention.keye_topk import keye_index_buf_accessor
+
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        keye_index_buf_accessor.SetKAndS.execute(
+            pool=self,
+            buf=buf,
+            loc=loc,
+            index_k=index_k,
+            index_k_scale=index_k_scale,
+        )
+
+    def get_state_buf_infos(self):
+        data_ptrs = [
+            self.index_k_with_scale_buffer[i].data_ptr() for i in range(self.layer_num)
+        ]
+        data_lens = [
+            self.index_k_with_scale_buffer[i].nbytes for i in range(self.layer_num)
+        ]
+        item_lens = [
+            self.index_k_with_scale_buffer[i][0].nbytes for i in range(self.layer_num)
+        ]
+        return data_ptrs, data_lens, item_lens
+
+    def _clear_buffers(self):
+        """Clear indexer buffer(s) in addition to main KV buffers."""
+        super()._clear_buffers()
+        if hasattr(self, "index_k_with_scale_buffer") and self.index_k_with_scale_buffer is not None:
+            del self.index_k_with_scale_buffer
+
+    def get_kv_size_bytes(self):
+        """Return (K, V, Indexer) 3-tuple so _finalize_allocation_log logs each
+        component separately (matches the abstract base's 3-tuple branch)."""
+        k_size_bytes, v_size_bytes = super().get_kv_size_bytes()
+        indexer_bytes = 0
+        if self.index_k_with_scale_buffer is not None:
+            indexer_bytes = sum(
+                get_tensor_size_bytes(buf) for buf in self.index_k_with_scale_buffer
+            )
+        return k_size_bytes, v_size_bytes, indexer_bytes

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import get_keye_indexer_head_dim, get_nsa_index_head_dim, is_deepseek_nsa, is_keye_topk_mask
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
+    KeyeTokenToKVPool,
     MHATokenToKVPool,
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
@@ -548,25 +549,48 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
-                    self.token_to_kv_pool = MHATokenToKVPool(
-                        self.max_total_num_tokens,
-                        page_size=self.page_size,
-                        dtype=self.kv_cache_dtype,
-                        head_num=self.model_config.get_num_kv_heads(
-                            get_attention_tp_size()
-                        ),
-                        head_dim=self.model_config.head_dim,
-                        v_head_dim=self.model_config.v_head_dim,
-                        layer_num=self.num_effective_layers,
-                        device=self.device,
-                        enable_memory_saver=self.server_args.enable_memory_saver,
-                        start_layer=self.start_layer,
-                        end_layer=self.end_layer,
-                        enable_alt_stream=not self.server_args.enable_pdmux,
-                        enable_kv_cache_copy=(
-                            self.server_args.speculative_algorithm is not None
-                        ),
-                    )
+                    is_keye_model = is_keye_topk_mask(self.model_config.hf_config)
+                    if is_keye_model:
+                        self.token_to_kv_pool = KeyeTokenToKVPool(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            head_num=self.model_config.get_num_kv_heads(
+                                get_attention_tp_size()
+                            ),
+                            head_dim=self.model_config.head_dim,
+                            v_head_dim=self.model_config.v_head_dim,
+                            layer_num=self.num_effective_layers,
+                            device=self.device,
+                            index_head_dim=get_keye_indexer_head_dim(self.model_config.hf_config),
+                            enable_memory_saver=self.server_args.enable_memory_saver,
+                            start_layer=self.start_layer,
+                            end_layer=self.end_layer,
+                            enable_alt_stream=not self.server_args.enable_pdmux,
+                            enable_kv_cache_copy=(
+                                self.server_args.speculative_algorithm is not None
+                            ),
+                        )
+                    else:
+                        self.token_to_kv_pool = MHATokenToKVPool(
+                            self.max_total_num_tokens,
+                            page_size=self.page_size,
+                            dtype=self.kv_cache_dtype,
+                            head_num=self.model_config.get_num_kv_heads(
+                                get_attention_tp_size()
+                            ),
+                            head_dim=self.model_config.head_dim,
+                            v_head_dim=self.model_config.v_head_dim,
+                            layer_num=self.num_effective_layers,
+                            device=self.device,
+                            enable_memory_saver=self.server_args.enable_memory_saver,
+                            start_layer=self.start_layer,
+                            end_layer=self.end_layer,
+                            enable_alt_stream=not self.server_args.enable_pdmux,
+                            enable_kv_cache_copy=(
+                                self.server_args.speculative_algorithm is not None
+                            ),
+                        )
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")

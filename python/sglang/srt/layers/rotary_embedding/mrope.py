@@ -367,6 +367,34 @@ class MRotaryEmbedding(RotaryEmbedding):
             input_ids, hf_config, image_grid_thw, video_grid_thw, **kwargs
         )
 
+    @staticmethod
+    def get_rope_index_keye(
+        spatial_merge_size,
+        image_token_id,
+        video_token_id,
+        vision_start_token_id,
+        model_type,
+        input_ids=None,
+        image_grid_thw=None,
+        video_grid_thw=None,
+        attention_mask=None,
+    ):
+        from sglang.srt.layers.rotary_embedding.mrope_rope_index import (
+            get_rope_index_keye,
+        )
+
+        return get_rope_index_keye(
+            spatial_merge_size,
+            image_token_id,
+            video_token_id,
+            vision_start_token_id,
+            model_type,
+            input_ids,
+            image_grid_thw,
+            video_grid_thw,
+            attention_mask,
+        )
+
 
 class YaRNScalingMRotaryEmbedding(MRotaryEmbedding):
     """MRoPE-enabled rotary embedding with YaRN context scaling."""

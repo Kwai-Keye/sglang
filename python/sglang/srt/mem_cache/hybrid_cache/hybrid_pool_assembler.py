@@ -3,12 +3,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     HostPoolGroup,
+    KeyeIndexerPoolHost,
     MambaPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
@@ -479,6 +480,69 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
         )
     except Exception:
         logger.exception("attach_hybrid_nsa_pool_to_hiradix_cache failed")
+        raise
+
+
+def attach_hybrid_keye_pool_to_hiradix_cache(
+    radix_cache: HiRadixCache,
+    params: CacheInitParams,
+    server_args: ServerArgs,
+    *,
+    extra_config: dict,
+    prefetch_threshold: int,
+    enable_storage_metrics: bool,
+    load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
+) -> None:
+    """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
+
+    This entrypoint is for HiRadixCache's Keye Top-K Mask path.
+    Follows the same pattern as NSA: anchor MHATokenToKVPoolHost for main KV,
+    with KeyeIndexerPoolHost as the shared indexer pool.
+    """
+    try:
+        kv = radix_cache.kv_cache
+        layer_mapping = {layer_id: layer_id for layer_id in range(kv.layer_num)}
+        host_pool_group, cache_controller = build_shared_anchor_stack(
+            params=params,
+            server_args=server_args,
+            kv_pool=kv,
+            shared_pool_name=PoolName.INDEXER,
+            full_layer_mapping=layer_mapping,
+            page_size=radix_cache.page_size,
+            tp_group=radix_cache.tp_group,
+            load_cache_event=load_cache_event,
+            attn_cp_group=attn_cp_group,
+            attn_tp_group=attn_tp_group,
+            storage_backend=server_args.hicache_storage_backend,
+            use_mla=False,  # Keye uses MHA layout, not MLA
+            prefetch_threshold=prefetch_threshold,
+            shared_host_pool_factory=lambda kv_host_pool: KeyeIndexerPoolHost(
+                kv,
+                kv_host_pool,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            ),
+            model_name=server_args.served_model_name,
+            storage_backend_extra_config=extra_config,
+            pp_rank=radix_cache.pp_rank,
+            pp_size=radix_cache.pp_size,
+            attn_cp_rank=params.attn_cp_rank,
+            attn_cp_size=params.attn_cp_size,
+            enable_storage_metrics=enable_storage_metrics,
+        )
+        radix_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
+        radix_cache.token_to_kv_pool_host = host_pool_group
+        radix_cache.cache_controller = cache_controller
+        kv.register_layer_transfer_counter(cache_controller.layer_done_counter)
+        logger.info(
+            "Attached hybrid Keye pool stack to HiRadixCache: pools=KV + INDEXER, "
+            "transfer_layer_num=%s",
+            len(layer_mapping),
+        )
+    except Exception:
+        logger.exception("attach_hybrid_keye_pool_to_hiradix_cache failed")
         raise
 
 

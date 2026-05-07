@@ -36,13 +36,16 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     attach_hybrid_nsa_pool_to_hiradix_cache,
+    attach_hybrid_keye_pool_to_hiradix_cache,
 )
 from sglang.srt.mem_cache.memory_pool import (
+    KeyeTokenToKVPool,
     MHATokenToKVPool,
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
+    KeyeIndexerPoolHost,
     MHATokenToKVPoolHost,
     MLATokenToKVPoolHost,
 )
@@ -70,7 +73,15 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        if isinstance(self.kv_cache, MHATokenToKVPool):
+
+        # IMPORTANT: Check KeyeTokenToKVPool before MHATokenToKVPool since Keye
+        # inherits from MHA. Wrong order would silently create MHA host pool.
+        if isinstance(self.kv_cache, KeyeTokenToKVPool):
+            # Filled by attach_hybrid_keye_pool_to_hiradix_cache after storage extra_config is parsed.
+            # Creating MHATokenToKVPoolHost here would cause a duplicate allocation
+            # (build_shared_anchor_stack also creates one), wasting ~80 GB pinned host memory.
+            self.token_to_kv_pool_host = None
+        elif isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -122,6 +133,18 @@ class HiRadixCache(RadixCache):
         self.load_cache_event = threading.Event()
         if isinstance(self.kv_cache, NSATokenToKVPool):
             attach_hybrid_nsa_pool_to_hiradix_cache(
+                self,
+                params,
+                server_args,
+                extra_config=extra_config,
+                prefetch_threshold=prefetch_threshold,
+                enable_storage_metrics=self.enable_storage_metrics,
+                load_cache_event=self.load_cache_event,
+                attn_cp_group=self.attn_cp_group,
+                attn_tp_group=self.attn_tp_group,
+            )
+        elif isinstance(self.kv_cache, KeyeTokenToKVPool):
+            attach_hybrid_keye_pool_to_hiradix_cache(
                 self,
                 params,
                 server_args,
@@ -635,7 +658,7 @@ class HiRadixCache(RadixCache):
     def _get_extra_pools(self) -> dict:
         if not isinstance(self.cache_controller, HybridCacheController):
             return {}
-        if isinstance(self.kv_cache, NSATokenToKVPool):
+        if isinstance(self.kv_cache, (NSATokenToKVPool, KeyeTokenToKVPool)):
             pool = PoolTransfer(
                 name=PoolName.INDEXER,
                 hit_policy=PoolHitPolicy.ALL_PAGES,
@@ -714,6 +737,11 @@ class HiRadixCache(RadixCache):
             else None
         )
 
+        logger.debug(
+            f"[HiCache] write_backup_storage: node_id={node.id}, "
+            f"num_tokens={len(node.key)}, hash_pages={len(node.hash_value)}"
+        )
+
         operation_id = self.cache_controller.write_storage(
             node.host_value,
             node.key,
@@ -748,6 +776,10 @@ class HiRadixCache(RadixCache):
                             backuped_node, medium=StorageMedium.CPU
                         )
                         if self.enable_storage:
+                            logger.debug(
+                                f"[HiCache] writing_check(write_back): DMA confirmed for "
+                                f"node={backuped_node.id}, triggering write_backup_storage"
+                            )
                             self.write_backup_storage(backuped_node)
                 self.cache_controller.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
@@ -776,6 +808,10 @@ class HiRadixCache(RadixCache):
                 self._record_store_event(backuped_node, medium=StorageMedium.CPU)
                 self.dec_lock_ref(backuped_node)
                 if self.enable_storage:
+                    logger.debug(
+                        f"[HiCache] writing_check: DMA confirmed for "
+                        f"node={backuped_node.id}, triggering write_backup_storage"
+                    )
                     self.write_backup_storage(backuped_node)
             finish_count -= 1
 
@@ -1280,6 +1316,11 @@ class HiRadixCache(RadixCache):
             or self.cache_controller.prefetch_rate_limited()
         ):
             return
+
+        logger.debug(
+            f"[HiCache] prefetch_from_storage: req_id={req_id}, "
+            f"prefetch_length={prefetch_length}"
+        )
 
         last_host_node.protect_host()
         host_indices = self.cache_controller.mem_pool_host.alloc(prefetch_length)

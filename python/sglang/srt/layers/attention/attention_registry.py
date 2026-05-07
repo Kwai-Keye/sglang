@@ -273,3 +273,10 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("keye_sa")
+def create_keye_sa_backend(runner):
+    from sglang.srt.layers.attention.keye_sa_backend import KeyeSparseAttnBackend
+
+    return KeyeSparseAttnBackend(runner)

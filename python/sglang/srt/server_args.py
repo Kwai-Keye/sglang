@@ -152,6 +152,7 @@ ATTENTION_BACKEND_CHOICES = [
     "trtllm_mla",
     "trtllm_mha",
     "dual_chunk_flash_attn",
+    "keye_sa",
     # AMD specific
     "aiter",
     "wave",
@@ -509,6 +510,7 @@ class ServerArgs:
         None  # auto-detect based on hardware/kv_cache_dtype
     )
     disable_flashinfer_autotune: bool = False
+    deterministic_topk: bool = False
     mamba_backend: str = "triton"
 
     # Speculative decoding
@@ -759,12 +761,15 @@ class ServerArgs:
     sm_group_num: int = 8
 
     # For Multi-Modal
+    mm_max_concurrent_calls: int = 32
+    mm_per_request_timeout: float = 10.0
     enable_broadcast_mm_inputs_process: bool = False
     enable_prefix_mm_cache: bool = False
     mm_enable_dp_encoder: bool = False
     mm_process_config: Optional[Dict[str, Any]] = None
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
     enable_mm_global_cache: bool = False
+    mm_processor_workers: int = 1
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -2301,6 +2306,29 @@ class ServerArgs:
                 "as the first layer might not be an attention layer"
             )
 
+        elif model_arch in [
+            "KeyeVL2ForConditionalGeneration",
+            "KeyeVL2MoeForConditionalGeneration",
+        ]:
+            # Keye Top-K Mask model (dense or MoE) with sparse attention.
+            # Both prefill and decode use keye_sa.
+            if self.prefill_attention_backend is None:
+                self.prefill_attention_backend = "keye_sa"
+                logger.info(
+                    f"Auto-selecting keye_sa prefill attention backend for {model_arch}"
+                )
+            if self.decode_attention_backend is None:
+                self.decode_attention_backend = "keye_sa"
+                logger.info(
+                    f"Auto-selecting keye_sa decode attention backend for {model_arch}"
+                )
+            # Sync attention_backend for compatibility checks downstream
+            if self.attention_backend is None:
+                self.attention_backend = self.decode_attention_backend
+            # Force page_size=64 for Keye models.
+            self.page_size = 64
+            logger.info("Setting page_size=64 for Keye model.")
+
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]
             and is_hip()
@@ -3188,6 +3216,15 @@ class ServerArgs:
         3) I/O <-> decode-attention compatibility (may rewrite I/O or decode backend).
         4) Re-run step (1) if step (3) changed I/O backend.
         """
+        # Keye models must use direct io backend for indexer buffer compatibility.
+        if self.enable_hierarchical_cache and self.decode_attention_backend == "keye_sa":
+            if self.hicache_io_backend != "direct":
+                self.hicache_io_backend = "direct"
+                logger.warning(
+                    "Keye models require hicache_io_backend='direct' for indexer buffer compatibility. "
+                    "Overriding hicache_io_backend to 'direct'."
+                )
+
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             self.enable_hierarchical_cache
@@ -5359,6 +5396,12 @@ class ServerArgs:
             action="store_true",
             help="Disable FlashInfer autotuning.",
         )
+        parser.add_argument(
+            "--deterministic-topk",
+            default=ServerArgs.deterministic_topk,
+            action="store_true",
+            help="Enable deterministic topk.",
+        )
 
         # Speculative decoding
         parser.add_argument(
@@ -6596,6 +6639,27 @@ class ServerArgs:
         )
 
         # For Multi-Modal
+        parser.add_argument(
+            "--mm-max-concurrent-calls",
+            type=int,
+            default=ServerArgs.mm_max_concurrent_calls,
+            help="The max concurrent calls for async mm data processing.",
+        )
+        parser.add_argument(
+            "--mm-per-request-timeout",
+            type=float,
+            default=ServerArgs.mm_per_request_timeout,
+            help=(
+                "The timeout for each multi-modal request in seconds. "
+                "Set to <= 0 to disable."
+            ),
+        )
+        parser.add_argument(
+            "--mm-processor-workers",
+            type=int,
+            default=ServerArgs.mm_processor_workers,
+            help="Number of workers for multiprocessing multimodal data processing.",
+        )
         parser.add_argument(
             "--enable-broadcast-mm-inputs-process",
             action="store_true",

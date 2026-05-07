@@ -9,7 +9,7 @@ import logging
 import jinja2
 import transformers.utils.chat_template_utils as hf_chat_utils
 
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import ImageData, VideoData
 
 logger = logging.getLogger(__name__)
 
@@ -160,12 +160,14 @@ def process_content_for_template_format(
                 if chunk_type == "image_url":
                     image_obj = chunk.get("image_url") or {}
                     mdp = image_obj.get("max_dynamic_patch", None)
-                    # Also allow flat style: chunk["max_dynamic_patch"]
+                    # Extract preprocess_kwargs from image_url object (same as max_dynamic_patch)
+                    preprocess_kwargs = image_obj.get("preprocess_kwargs") or None
                     image_data.append(
                         ImageData(
                             url=image_obj["url"],
                             detail=image_obj.get("detail", "auto"),
                             max_dynamic_patch=mdp,
+                            preprocess_kwargs=preprocess_kwargs,
                         )
                     )
 
@@ -175,17 +177,15 @@ def process_content_for_template_format(
                     processed_content_parts.append({"type": "image"})
                 elif chunk_type == "video_url":
                     video_obj = chunk.get("video_url") or {}
-                    mdp = video_obj.get("max_dynamic_patch", None)
-                    if mdp is None:
-                        video_data.append(chunk["video_url"]["url"])
-                    else:
-                        # Keep structured info for backend, but template only sees {"type":"video"}
-                        video_data.append(
-                            {
-                                "url": video_obj["url"],
-                                "max_dynamic_patch": mdp,
-                            }
+                    # Extract preprocess_kwargs from video_url object (same as max_dynamic_patch)
+                    preprocess_kwargs = video_obj.get("preprocess_kwargs") or None
+                    # Use VideoData to carry preprocess_kwargs
+                    video_data.append(
+                        VideoData(
+                            url=video_obj["url"],
+                            preprocess_kwargs=preprocess_kwargs,
                         )
+                    )
                     if chunk.get("modalities"):
                         modalities.append(chunk.get("modalities"))
                     # Normalize to simple 'video' type for template compatibility
