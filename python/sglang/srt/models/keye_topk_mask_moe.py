@@ -28,7 +28,7 @@ from sglang.srt.models.keye_qwen3 import KeyeVL1_5ForConditionalGeneration
 from sglang.srt.models.qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from sglang.srt.models.qwen3_vl_moe import load_fused_expert_weights
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.utils import add_prefix, is_cuda, print_info_once
+from sglang.srt.utils import add_prefix, is_cuda, is_hopper_with_cuda_12_3, print_info_once
 
 _is_cuda = is_cuda()
 
@@ -36,12 +36,6 @@ logger = logging.getLogger(__name__)
 
 
 class KeyeTopKMaskMoeDecoderLayer(Qwen3MoeDecoderLayer):
-    """
-    Decoder 层，继承自 Qwen3MoeDecoderLayer，只替换 self_attn：
-    - Attention: KeyeTopKMaskAttention (Top-K Mask 稀疏注意力)
-    - MLP: Qwen3MoeSparseMoeBlock (继承自父类，MoE)
-    """
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -50,7 +44,6 @@ class KeyeTopKMaskMoeDecoderLayer(Qwen3MoeDecoderLayer):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        # 调用父类初始化：构建 mlp (MoE)、layer norms、layer_communicator 等
         super().__init__(
             config=config,
             layer_id=layer_id,
@@ -59,36 +52,28 @@ class KeyeTopKMaskMoeDecoderLayer(Qwen3MoeDecoderLayer):
             alt_stream=alt_stream,
         )
 
-        # 替换 self_attn 为 KeyeTopKMaskAttention
         sa_config = getattr(config, "sa_config", None)
-        head_dim = getattr(config, "head_dim", None)
-        self.self_attn = KeyeTopKMaskAttention(
-            hidden_size=config.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            layer_id=layer_id,
-            rope_theta=getattr(config, "rope_theta", 1000000),
-            rope_scaling=getattr(config, "rope_scaling", None),
-            head_dim=head_dim,
-            max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
-            quant_config=quant_config,
-            rms_norm_eps=config.rms_norm_eps,
-            attention_bias=config.attention_bias,
-            prefix=add_prefix("self_attn", prefix),
-            alt_stream=alt_stream,
-            sa_config=sa_config,
-        )
+        if is_hopper_with_cuda_12_3() and sa_config is not None:
+            head_dim = getattr(config, "head_dim", None)
+            self.self_attn = KeyeTopKMaskAttention(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                rope_theta=getattr(config, "rope_theta", 1000000),
+                rope_scaling=getattr(config, "rope_scaling", None),
+                head_dim=head_dim,
+                max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
+                quant_config=quant_config,
+                rms_norm_eps=config.rms_norm_eps,
+                attention_bias=config.attention_bias,
+                prefix=add_prefix("self_attn", prefix),
+                alt_stream=alt_stream,
+                sa_config=sa_config,
+            )
 
 
 class KeyeTopKMaskMoeModel(Qwen3MoeModel):
-    """
-    KeyeTopKMask MoE 语言模型（纯LLM，不含视觉组件）
-
-    继承自 Qwen3MoeModel，传入 KeyeTopKMaskMoeDecoderLayer 作为 decoder layer type：
-    - Attention: Top-K Mask 稀疏注意力
-    - MLP: Mixture of Experts (继承自 Qwen3MoeModel)
-    """
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -126,6 +111,8 @@ class KeyeVL2MoeForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
+        # 始终使用 KeyeTopKMaskMoeModel 作为语言模型
+        # 语言模型内部会根据GPU架构选择合适的 decoder layer
         super().__init__(
             config=config,
             quant_config=quant_config,
@@ -195,7 +182,7 @@ class KeyeVL2MoeForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
             # sa_indexer 权重：直接加载，跳过所有融合映射
             if "sa_indexer" in name:
                 if name not in params_dict:
-                    print_info_once(f"Skipping sa_indexer weight (not in model): {name}")
+                    # print_info_once(f"Skipping sa_indexer weight (not in model): {name}")
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

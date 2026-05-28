@@ -2311,23 +2311,30 @@ class ServerArgs:
             "KeyeVL2MoeForConditionalGeneration",
         ]:
             # Keye Top-K Mask model (dense or MoE) with sparse attention.
-            # Both prefill and decode use keye_sa.
-            if self.prefill_attention_backend is None:
-                self.prefill_attention_backend = "keye_sa"
+            # Only apply keye_sa attention backend on Hopper GPU.
+            if is_hopper_with_cuda_12_3():
+                # Both prefill and decode use keye_sa on Hopper.
+                if self.prefill_attention_backend is None:
+                    self.prefill_attention_backend = "keye_sa"
+                    logger.info(
+                        f"Auto-selecting keye_sa prefill attention backend for {model_arch}"
+                    )
+                if self.decode_attention_backend is None:
+                    self.decode_attention_backend = "keye_sa"
+                    logger.info(
+                        f"Auto-selecting keye_sa decode attention backend for {model_arch}"
+                    )
+                # Sync attention_backend for compatibility checks downstream
+                if self.attention_backend is None:
+                    self.attention_backend = self.decode_attention_backend
+                # Force page_size=64 for Keye models on Hopper.
+                self.page_size = 64
+                logger.info("Setting page_size=64 for Keye model on Hopper GPU.")
+            else:
+                # On non-Hopper GPU, use default attention backend.
                 logger.info(
-                    f"Auto-selecting keye_sa prefill attention backend for {model_arch}"
+                    f"Using default attention backend for {model_arch} on non-Hopper GPU."
                 )
-            if self.decode_attention_backend is None:
-                self.decode_attention_backend = "keye_sa"
-                logger.info(
-                    f"Auto-selecting keye_sa decode attention backend for {model_arch}"
-                )
-            # Sync attention_backend for compatibility checks downstream
-            if self.attention_backend is None:
-                self.attention_backend = self.decode_attention_backend
-            # Force page_size=64 for Keye models.
-            self.page_size = 64
-            logger.info("Setting page_size=64 for Keye model.")
 
         if (
             model_arch in ["Qwen3VLForConditionalGeneration"]

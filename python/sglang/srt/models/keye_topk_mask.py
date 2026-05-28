@@ -12,7 +12,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.attention.keye_topk.keye_indexer import KeyeIndexer
-from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -25,10 +24,10 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.keye_qwen3 import KeyeVL1_5ForConditionalGeneration
-from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
-from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP, Qwen2Model
+from sglang.srt.models.qwen3 import Qwen3DecoderLayer
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import add_prefix, is_cuda, print_info_once
+from sglang.srt.utils import add_prefix, is_cuda, is_hopper_with_cuda_12_3, print_info_once
 
 _is_cuda = is_cuda()
 
@@ -282,11 +281,7 @@ class KeyeTopKMaskAttention(nn.Module):
         return output
 
 
-class KeyeTopKMaskDecoderLayer(nn.Module):
-    """
-    Decoder 层,使用 KeyeTopKMaskAttention 替代标准 Attention
-    """
-
+class KeyeTopKMaskDecoderLayer(Qwen3DecoderLayer):
     def __init__(
         self,
         config,
@@ -295,118 +290,43 @@ class KeyeTopKMaskDecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 1000000)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
-        head_dim = getattr(config, "head_dim", None)
-        
-        # 获取 sa_config (如果存在)
-        sa_config = getattr(config, "sa_config", None)
-        
-        self.self_attn = KeyeTopKMaskAttention(
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
+        super().__init__(
+            config=config,
             layer_id=layer_id,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            head_dim=head_dim,
-            max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            rms_norm_eps=config.rms_norm_eps,
-            attention_bias=config.attention_bias,
-            prefix=add_prefix("self_attn", prefix),
+            prefix=prefix,
             alt_stream=alt_stream,
-            sa_config=sa_config,
-        )
-        self.mlp = Qwen3MLP(
-            hidden_size=self.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
         )
 
-        norm_kwargs = (
-            dict(
-                weight_dtype=torch.float32,
-                cast_x_before_out_mul=True,
-                override_orig_dtype=torch.float32,
-                fp32_residual=True,
+        sa_config = getattr(config, "sa_config", None)
+        if is_hopper_with_cuda_12_3() and sa_config is not None:
+            head_dim = getattr(config, "head_dim", None)
+            self.self_attn = KeyeTopKMaskAttention(
+                hidden_size=config.hidden_size,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                layer_id=layer_id,
+                rope_theta=getattr(config, "rope_theta", 1000000),
+                rope_scaling=getattr(config, "rope_scaling", None),
+                head_dim=head_dim,
+                max_position_embeddings=getattr(config, "max_position_embeddings", 32768),
+                quant_config=quant_config,
+                rms_norm_eps=config.rms_norm_eps,
+                attention_bias=config.attention_bias,
+                prefix=add_prefix("self_attn", prefix),
+                alt_stream=alt_stream,
+                sa_config=sa_config,
             )
-            if get_global_server_args().rl_on_policy_target is not None
-            else {}
-        )
-        self.input_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
-        )
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
-        )
-
-        # 使用 LayerCommunicator 来处理 layer norm 和残差连接 (sglang 风格)
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=config.num_hidden_layers,
-            is_layer_sparse=False,
-            is_previous_layer_sparse=False,
-        )
-        self.layer_communicator = LayerCommunicator(
-            layer_scatter_modes=self.layer_scatter_modes,
-            input_layernorm=self.input_layernorm,
-            post_attention_layernorm=self.post_attention_layernorm,
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        residual: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Self Attention
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-            )
-
-        # Fully Connected
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states,
-            residual,
-            forward_batch,
-            cache=None,
-        )
-        hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.layer_communicator.postprocess_layer(
-            hidden_states, residual, forward_batch
-        )
-        return hidden_states, residual
 
 
 
 class KeyeTopKMaskModel(Qwen2Model):
-    """
-    KeyeTopKMask 语言模型（纯LLM，不包含视觉组件）
-    
-    基于 Qwen2Model，使用 KeyeTopKMaskDecoderLayer 替换标准的 decoder layer
-    包含 Top-K Mask 稀疏注意力机制
-    """
-    
     def __init__(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        # 调用父类，传入自定义的 decoder_layer_type
         alt_stream = torch.cuda.Stream() if _is_cuda else None
         super().__init__(
             config=config,
@@ -415,36 +335,23 @@ class KeyeTopKMaskModel(Qwen2Model):
             decoder_layer_type=KeyeTopKMaskDecoderLayer,
             alt_stream=alt_stream,
         )
-        
-        # 打印初始化信息
-        if hasattr(config, 'sa_config') and config.sa_config:
-            print_info_once(
-                f"KeyeTopKMaskModel initialized with "
-                f"{config.num_hidden_layers} layers, "
-                f"Top-K Mask Attention enabled (topk={config.sa_config.get('topk', 512)})"
-            )
-        else:
-            print_info_once(
-                f"KeyeTopKMaskModel initialized with "
-                f"{config.num_hidden_layers} layers, "
-                f"⚠️ WARNING: sa_config not found in config, Indexer will not be created!"
-            )
 
 
 class KeyeVL2ForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
     """
     完整的 KeyeTopKMask 多模态模型
-    
+
     继承自 KeyeVL1_5ForConditionalGeneration，通过传入 language_model_cls 参数
     来使用 KeyeTopKMaskModel 作为语言模型主干
-    
+
     架构:
     - visual: KeyeSiglipVisionModel (视觉编码器) - 继承
     - mlp_AR: Projector (视觉→文本投影) - 继承
-    - model: KeyeTopKMaskModel (LLM 主干，使用 Top-K Mask Attention) - 通过 language_model_cls 指定
+    - model: KeyeTopKMaskModel (LLM 主干) - 通过 language_model_cls 指定
     - lm_head: 语言建模头 - 继承
     - 多模态处理逻辑 - 继承
     """
+
 
     def __init__(
         self,
@@ -452,8 +359,8 @@ class KeyeVL2ForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
-        # 调用父类初始化，传入 KeyeTopKMaskModel 作为 language_model_cls
-        # 父类会根据这个参数创建使用 Top-K Mask Attention 的语言模型
+        # 始终使用 KeyeTopKMaskModel 作为语言模型
+        # 语言模型内部会根据GPU架构选择合适的 decoder layer
         super().__init__(
             config=config,
             quant_config=quant_config,
@@ -486,7 +393,7 @@ class KeyeVL2ForConditionalGeneration(KeyeVL1_5ForConditionalGeneration):
             # 特殊处理 sa_indexer 权重：直接加载，不进行融合映射
             if "sa_indexer" in name:
                 if name not in params_dict:
-                    print_info_once(f"Skipping sa_indexer weight (not in model): {name}")
+                    # print_info_once(f"Skipping sa_indexer weight (not in model): {name}")
                     continue
                 # 直接加载，跳过 stacked_params_mapping
                 param = params_dict[name]
